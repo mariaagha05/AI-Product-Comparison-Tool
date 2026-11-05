@@ -174,6 +174,10 @@ class LLMError(Exception):
     """Raised with a user-friendly message."""
 
 
+class ModelUnavailableError(LLMError):
+    """The chosen model is retired, missing or not enabled for this key."""
+
+
 def esc(value) -> str:
     return html.escape("" if value is None else str(value))
 
@@ -254,6 +258,21 @@ def parse_document(name: str, data: bytes) -> str:
     return text
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def fetch_models(api_key: str) -> list:
+    """Ask Groq which chat models this key can use (empty list if the lookup fails)."""
+    if Groq is None or not api_key.strip():
+        return []
+    try:
+        client = Groq(api_key=api_key.strip(), timeout=15.0, max_retries=0)
+        items = client.models.list().data
+    except Exception:
+        return []
+    blocked = ("whisper", "tts", "guard", "playai", "orpheus", "embed", "safeguard")
+    ids = [m.id for m in items if getattr(m, "active", True) and not any(w in m.id.lower() for w in blocked)]
+    return sorted(ids, key=lambda i: (MODELS.index(i) if i in MODELS else 99, i))
+
+
 def parse_lines(raw: str) -> list:
     items = []
     for line in (raw or "").splitlines():
@@ -330,8 +349,9 @@ def call_llm(client, model, system, user, temperature=0.2, max_tokens=3000) -> d
             if use_json_mode and ("response_format" in low or "json_validate" in low or "json mode" in low):
                 use_json_mode = False
                 continue
-            if "decommissioned" in low or "does not exist" in low or "model_not_found" in low or name == "NotFoundError":
-                raise LLMError(f"The model '{model}' is not available on your Groq account. Choose another model in the sidebar.")
+            if ("decommissioned" in low or "does not exist" in low or "model_not_found" in low
+                    or "not have access" in low or "model_permission" in low or name == "NotFoundError"):
+                raise ModelUnavailableError(f"The model '{model}' is not available for this key. Groq said: {msg[:220]}")
             if name == "APIConnectionError" or "connection" in low or "timed out" in low:
                 if attempt < 2:
                     time.sleep(2)
@@ -848,7 +868,15 @@ def sidebar():
             "Groq API key", value=default_api_key(), type="password",
             help="Get a free key at console.groq.com. You can also set GROQ_API_KEY as an environment variable or in .streamlit/secrets.toml.",
         )
-        model = st.selectbox("Model", MODELS, index=0, help="The 70B model gives the best accuracy. The 8B model is faster and uses fewer tokens.")
+        live_models = fetch_models(api_key)
+        model = st.selectbox(
+            "Model", live_models or MODELS, index=0,
+            help="With a valid key this list shows the models your Groq account can use. Larger models are more accurate; smaller ones are faster.",
+        )
+        if live_models:
+            st.caption(f"{len(live_models)} models available on your account.")
+        elif api_key.strip():
+            st.caption("Could not load your model list, showing common models.")
         custom = st.text_input("Custom model name (optional)", placeholder="Overrides the choice above")
         temperature = st.slider("Creativity", 0.0, 1.0, 0.2, 0.05, help="Keep this low for factual comparisons.")
         max_chars = st.slider("Characters read per document", 3000, 24000, 9000, 1000,
@@ -955,19 +983,30 @@ def main():
                 st.error(msg)
         else:
             progress = st.progress(0.0, text="Starting")
-            try:
-                st.session_state["result"] = run_analysis(
-                    api_key, model, temperature, max_chars, docs, reqs, breakers,
-                    use_case.strip(), float(budget), currency.strip(), progress,
-                )
-            except LLMError as exc:
-                progress.empty()
-                st.error(str(exc))
-            except Exception as exc:  # noqa: BLE001
-                progress.empty()
-                st.error(f"Something unexpected went wrong ({type(exc).__name__}: {str(exc)[:200]}). Please try again.")
-            else:
-                progress.empty()
+            candidates = [model] + [m for m in (fetch_models(api_key) or MODELS) if m != model][:3]
+            failure = None
+            for candidate in candidates:
+                try:
+                    st.session_state["result"] = run_analysis(
+                        api_key, candidate, temperature, max_chars, docs, reqs, breakers,
+                        use_case.strip(), float(budget), currency.strip(), progress,
+                    )
+                    failure = None
+                    if candidate != model:
+                        st.info(f"'{model}' was not available, so the comparison used '{candidate}' instead.")
+                    break
+                except ModelUnavailableError as exc:
+                    failure = str(exc)
+                    continue
+                except LLMError as exc:
+                    failure = str(exc)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    failure = f"Something unexpected went wrong ({type(exc).__name__}: {str(exc)[:200]}). Please try again."
+                    break
+            progress.empty()
+            if failure:
+                st.error(failure)
 
     if st.session_state.get("result"):
         render_results(st.session_state["result"])
